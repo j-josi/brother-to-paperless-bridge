@@ -9,17 +9,13 @@ services:
     volumes:
       # Mapping local driver and certificate files into the container
       - ./brscan-skey-0.3.5-0.amd64.deb:/tmp/skey.deb:ro
-      # Only required if you use a self-signed SSL certificate for Paperless-ngx
-      - ./rootCA.crt:/usr/local/share/ca-certificates/rootCA.crt:ro
-
     environment:
       # Variables loaded from your .env file
       BRSCAN_IP: "${BRSCAN_IP}"
       PAPERLESS_URL: "${PAPERLESS_URL}"
       PAPERLESS_TOKEN: "${PAPERLESS_TOKEN}"
       SCAN_PC_NAME: "${SCAN_PC_NAME}"
-      AIRSANE_PORT: "${AIRSANE_PORT}"
-      
+
       # The scan script triggered by the scanner's hardware button
       SCAN_SCRIPT: |-
         #!/bin/bash
@@ -36,7 +32,7 @@ services:
         mkdir -p "$$TMP_DIR"
 
         echo "Starting batch scan from [$$DEVICE]..."
-        scanimage --device "$$DEVICE" --mode "Gray" --resolution 300 --format=tiff --batch="$$TMP_DIR/page%d.tiff"
+        scanimage --device "$$DEVICE" --mode "24bit Color[Fast]" --resolution 300 --format=tiff --batch="$$TMP_DIR/page%d.tiff"
 
         if [ "$$(ls -A "$$TMP_DIR")" ]; then
           FINAL_FILE="/tmp/scan_$${TIMESTAMP}_final.tiff"
@@ -58,7 +54,6 @@ services:
       - |
         # 1. Install the provided Skey tool
         dpkg -i /tmp/skey.deb || apt-get install -f -y
-        update-ca-certificates
 
         # 2. Set up scripts for the Brother scan button
         mkdir -p /opt/brother/scanner/brscan-skey/script/
@@ -69,18 +64,31 @@ services:
 
         # 3. Register the scanner in the driver
         brsaneconfig4 -r Brother_Scanner || true
-        brsaneconfig4 -a name=Brother_Scanner model=MFC-7360N ip="$$BRSCAN_IP"
+        brsaneconfig4 -a name=Brother_Scanner model=MFC-J480DW ip="$$BRSCAN_IP"
 
         # 4. Start background services for network discovery (mDNS/Avahi)
         mkdir -p /var/run/dbus && rm -f /var/run/dbus/pid && dbus-daemon --system --fork
         avahi-daemon -D
         sleep 2
-        
+
         # 5. Register the PC name on the scanner's display (from .env)
         echo "Registering PC name at scanner: $$SCAN_PC_NAME"
         brscan-skey -u "$$SCAN_PC_NAME"
+
+        # 6. Route the "File" and "Text/OCR" scan-to-PC types to the same
+        #    Paperless-ngx upload script as "Image", so all three work. This
+        #    must happen BEFORE brscan-skey -r, since that's what starts
+        #    brscan-skey-exe, which reads this config once at its own startup.
+        sed -i \
+          -e "s#^FILE=.*#FILE=\"bash  /opt/brother/scanner/brscan-skey/script/scantoimage.sh\"#" \
+          -e "s#^OCR=.*#OCR=\"bash  /opt/brother/scanner/brscan-skey/script/scantoimage.sh\"#" \
+          /opt/brother/scanner/brscan-skey/brscan-skey.config
+
+        # 7. Start the scan-button listener (brscan-skey-exe), now that its
+        #    config already has the correct File/OCR routing.
         brscan-skey -r
 
-        echo "SYSTEM READY! AirSane is listening on port: $$AIRSANE_PORT"
-        # 6. Start AirSane with the port defined in .env
-        exec /usr/local/bin/airsaned --listen-port="$$AIRSANE_PORT" --access-log=-
+        echo "SYSTEM READY! Waiting for scan-button presses (brscan-skey-exe is running in the background)."
+        # 8. Keep the container running in the foreground; the actual button listener
+        #    (brscan-skey-exe) was already started in the background by step 7.
+        exec tail -f /dev/null
